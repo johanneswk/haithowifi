@@ -7,6 +7,11 @@ treated as a Spider when its capabilities contain both `temp` and `setpoint`.
 A battery Spider only takes a new setpoint at its next poll (minutes), so the
 entity keeps the requested value as "pending" and shows that it is still
 waiting, until the Spider confirms it or the add-on gives up.
+
+Heating / cooling / idle is derived from the system state of the AutoTemp on
+the same add-on (`<base topic>/ithostatus`) and from the Spider's own values:
+heating when the room is below its setpoint, cooling when it is above its
+cooling setpoint.
 """
 
 import json
@@ -16,6 +21,7 @@ from homeassistant.components import mqtt
 from homeassistant.components.climate import (
     ClimateEntity,
     ClimateEntityFeature,
+    HVACAction,
     HVACMode,
 )
 from homeassistant.config_entries import ConfigEntry
@@ -40,6 +46,7 @@ from .utils import (
     get_entity_prefix,
     get_mqtt_command_topic,
     get_mqtt_remote_topic,
+    get_mqtt_state_topic,
 )
 
 # Wait this long after the last +/- press before sending, so quick presses
@@ -116,8 +123,9 @@ class IthoSpiderThermostat(ClimateEntity):
     _attr_has_entity_name = True
     _attr_should_poll = False
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_hvac_modes = [HVACMode.HEAT]
-    _attr_hvac_mode = HVACMode.HEAT
+    # The AutoTemp decides between heating and cooling by itself
+    _attr_hvac_modes = [HVACMode.HEAT_COOL]
+    _attr_hvac_mode = HVACMode.HEAT_COOL
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
     _attr_min_temp = 5.0
     _attr_max_temp = 30.0
@@ -130,14 +138,16 @@ class IthoSpiderThermostat(ClimateEntity):
         self._remote_name = remote_name
         self._remote_index = 0
         self._command_topic = get_mqtt_command_topic(config_entry.data)
-        self._state_topic = get_mqtt_remote_topic(config_entry.data)
+        self._remote_topic = get_mqtt_remote_topic(config_entry.data)
+        self._status_topic = get_mqtt_state_topic(config_entry.data)
+
+        self._caps: dict | None = None  # latest Spider data
+        self._status: dict | None = None  # latest AutoTemp status
 
         # Setpoint the user asked for that the Spider has not confirmed yet
-        self._pending_setpoint: float | None = None
+        self._pending: float | None = None
         self._sent_at: float | None = None  # None until the command is sent
         self._cancel_send = None
-        self._battery = None
-        self._presence = None
 
         self._attr_name = remote_name
         self._attr_device_info = DeviceInfo(
@@ -153,74 +163,129 @@ class IthoSpiderThermostat(ClimateEntity):
 
         self._apply(initial_payload)
 
+    # ---- presentation -------------------------------------------------
+
     @property
     def icon(self) -> str | None:
-        """Show an hourglass while the Spider has not taken the setpoint."""
-        return "mdi:timer-sand" if self._pending_setpoint is not None else None
+        """Hourglass while waiting; otherwise the default heating/cooling icon."""
+        return "mdi:timer-sand" if self._pending is not None else None
 
     @property
     def extra_state_attributes(self) -> dict:
         """Extra attributes, including whether the setpoint is still pending."""
+        caps = self._caps or {}
         return {
             "setpoint_status": (
-                "waiting for Spider" if self._pending_setpoint is not None else "applied"
+                "waiting for Spider" if self._pending is not None else "applied"
             ),
-            "pending_setpoint": self._pending_setpoint,
-            "battery": self._battery,
-            "presence": self._presence,
+            "pending_setpoint": self._pending,
+            "setpoint_cool": caps.get("setpoint_cool"),
+            "system_state": self._system_state(),
+            "battery": caps.get("battery"),
+            "presence": bool(caps["pir"]) if "pir" in caps else None,
         }
 
-    def _apply(self, payload: dict) -> None:
-        """Update state from a remotesinfo payload (does not write state)."""
-        capabilities = payload.get(self._remote_name)
-        if not _is_spider(capabilities):
+    # ---- state --------------------------------------------------------
+
+    def _system_state(self) -> str | None:
+        """System-wide state of the AutoTemp."""
+        status = self._status
+        if not status:
+            return None
+        if status.get("state hand") == 1:
+            return "hand"
+        if status.get("State heating") == 1:
+            return "heating"
+        if status.get("State cool") == 1:
+            return "cooling"
+        if status.get("State off") == 1:
+            return "off"
+        return "idle"
+
+    def _action(self) -> HVACAction | None:
+        """Heating, cooling or idle for this room."""
+        state = self._system_state()
+        caps = self._caps
+        if state is None or caps is None:
+            return None
+
+        temp = caps.get("temp")
+        if state == "heating":
+            setpoint = caps.get("setpoint")
+            if temp is not None and setpoint is not None and temp < setpoint:
+                return HVACAction.HEATING
+            return HVACAction.IDLE
+        if state == "cooling":
+            cool = caps.get("setpoint_cool")
+            if temp is not None and cool is not None and temp > cool:
+                return HVACAction.COOLING
+            return HVACAction.IDLE
+        if state == "off":
+            return HVACAction.OFF
+        return HVACAction.IDLE
+
+    def _refresh(self) -> None:
+        """Recalculate everything from the latest data (does not write state)."""
+        caps = self._caps
+        if caps is None:
             self._attr_available = False
             return
 
+        reported = caps.get("setpoint")
+        commanded = caps.get("setpoint_cmd")
+
+        # Is the pending setpoint done?
+        if self._pending is not None and self._sent_at is not None:
+            waited = time.monotonic() - self._sent_at
+            if _same(reported, self._pending):
+                self._pending = None  # the Spider took it
+            elif waited > PENDING_TIMEOUT:
+                self._pending = None  # the add-on stopped trying
+            elif (
+                waited > DROP_GRACE
+                and commanded is not None
+                and not _same(commanded, self._pending)
+            ):
+                _LOGGER.debug(
+                    "%s: pending setpoint dropped by the add-on", self._remote_name
+                )
+                self._pending = None  # e.g. changed on the Spider itself
+
         self._attr_available = True
-        self._attr_current_temperature = capabilities.get("temp")
-        self._battery = capabilities.get("battery")
-        self._presence = bool(capabilities.get("pir"))
-
-        reported = capabilities.get("setpoint")
-        commanded = capabilities.get("setpoint_cmd")
-
-        if self._pending_setpoint is not None:
-            if _same(reported, self._pending_setpoint):
-                # The Spider took it
-                self._pending_setpoint = None
-            elif self._sent_at is not None:
-                waited = time.monotonic() - self._sent_at
-                if waited > PENDING_TIMEOUT:
-                    # The add-on stopped trying
-                    self._pending_setpoint = None
-                elif (
-                    waited > DROP_GRACE
-                    and commanded is not None
-                    and not _same(commanded, self._pending_setpoint)
-                ):
-                    # The add-on dropped it, e.g. changed on the Spider itself
-                    _LOGGER.debug(
-                        "%s: pending setpoint dropped by the add-on", self._remote_name
-                    )
-                    self._pending_setpoint = None
-
+        self._attr_current_temperature = caps.get("temp")
         # Keep showing the requested value while it is pending
         self._attr_target_temperature = (
-            self._pending_setpoint if self._pending_setpoint is not None else reported
+            self._pending if self._pending is not None else reported
         )
+        self._attr_hvac_action = self._action()
 
-        # The add-on lists remotes in slot order and skips empty slots; the
-        # position in the message is the `rfremoteindex` the add-on expects.
-        self._remote_index = list(payload).index(self._remote_name)
+    def _apply(self, payload: dict) -> None:
+        """Update from a remotesinfo payload (does not write state)."""
+        capabilities = payload.get(self._remote_name)
+        self._caps = capabilities if _is_spider(capabilities) else None
+        if self._caps is not None:
+            # The add-on lists remotes in slot order and skips empty slots; the
+            # position in the message is the `rfremoteindex` it expects.
+            self._remote_index = list(payload).index(self._remote_name)
+        self._refresh()
+
+    # ---- MQTT ---------------------------------------------------------
 
     async def async_added_to_hass(self) -> None:
         """Subscribe to MQTT events."""
         self.async_on_remove(
             await mqtt.async_subscribe(
                 self.hass,
-                self._state_topic,
-                self._message_received,
+                self._remote_topic,
+                self._remote_message,
+                MQTT_DEFAULT_QOS_SUBSCRIBE,
+            )
+        )
+        self.async_on_remove(
+            await mqtt.async_subscribe(
+                self.hass,
+                self._status_topic,
+                self._status_message,
                 MQTT_DEFAULT_QOS_SUBSCRIBE,
             )
         )
@@ -232,8 +297,8 @@ class IthoSpiderThermostat(ClimateEntity):
             self._cancel_send = None
 
     @callback
-    def _message_received(self, msg) -> None:
-        """Handle remotesinfo update."""
+    def _remote_message(self, msg) -> None:
+        """Handle a remotesinfo update."""
         try:
             payload = json.loads(msg.payload)
         except ValueError:
@@ -242,15 +307,29 @@ class IthoSpiderThermostat(ClimateEntity):
             self._apply(payload)
             self.async_write_ha_state()
 
+    @callback
+    def _status_message(self, msg) -> None:
+        """Handle an AutoTemp status update."""
+        try:
+            payload = json.loads(msg.payload)
+        except ValueError:
+            return
+        if isinstance(payload, dict):
+            self._status = payload
+            self._refresh()
+            self.async_write_ha_state()
+
+    # ---- commands -----------------------------------------------------
+
     async def async_set_temperature(self, **kwargs) -> None:
         """Remember the new setpoint and send it once the user stopped changing it."""
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
             return
 
-        self._pending_setpoint = float(temperature)
+        self._pending = float(temperature)
         self._sent_at = None  # not sent yet
-        self._attr_target_temperature = self._pending_setpoint
+        self._refresh()
         self.async_write_ha_state()
 
         # Restart the delay on every change so +/- presses are sent as one command
@@ -261,23 +340,20 @@ class IthoSpiderThermostat(ClimateEntity):
     async def _send_pending(self, _now) -> None:
         """Send the pending setpoint to the Spider via the add-on."""
         self._cancel_send = None
-        if self._pending_setpoint is None:
+        if self._pending is None:
             return
 
         await mqtt.async_publish(
             self.hass,
             self._command_topic,
             json.dumps(
-                {
-                    "rfsetpoint": self._pending_setpoint,
-                    "rfremoteindex": self._remote_index,
-                }
+                {"rfsetpoint": self._pending, "rfremoteindex": self._remote_index}
             ),
             MQTT_DEFAULT_QOS_PUBLISH,
         )
         self._sent_at = time.monotonic()
+        self._refresh()
         self.async_write_ha_state()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Only HEAT is supported; nothing to do."""
-
+        """The AutoTemp chooses heating or cooling; nothing to do."""
