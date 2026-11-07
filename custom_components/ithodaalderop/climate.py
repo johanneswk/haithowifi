@@ -3,9 +3,14 @@
 One climate entity is created per Spider that shows up in the add-on's
 `<base topic>/remotesinfo` MQTT message. Nothing is hard coded: a remote is
 treated as a Spider when its capabilities contain both `temp` and `setpoint`.
+
+A battery Spider only takes a new setpoint at its next poll (minutes), so the
+entity keeps the requested value as "pending" and shows that it is still
+waiting, until the Spider confirms it or the add-on gives up.
 """
 
 import json
+import time
 
 from homeassistant.components import mqtt
 from homeassistant.components.climate import (
@@ -18,6 +23,7 @@ from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 from homeassistant.util import slugify
 
 from .const import (
@@ -36,6 +42,15 @@ from .utils import (
     get_mqtt_remote_topic,
 )
 
+# Wait this long after the last +/- press before sending, so quick presses
+# are sent as one command.
+SEND_DELAY = 3  # seconds
+# The add-on keeps a setpoint pending for 15 minutes; wait slightly longer.
+PENDING_TIMEOUT = 16 * 60  # seconds after sending
+# After sending, give the add-on this long to publish its own state before a
+# different `setpoint_cmd` is taken as "dropped".
+DROP_GRACE = 30  # seconds
+
 
 def _is_spider(capabilities) -> bool:
     """A remote is a Spider thermostat if it reports a room temp and a setpoint."""
@@ -44,6 +59,11 @@ def _is_spider(capabilities) -> bool:
         and "temp" in capabilities
         and "setpoint" in capabilities
     )
+
+
+def _same(a, b) -> bool:
+    """Compare two temperatures."""
+    return a is not None and b is not None and abs(float(a) - float(b)) < 0.05
 
 
 async def async_setup_entry(
@@ -112,6 +132,13 @@ class IthoSpiderThermostat(ClimateEntity):
         self._command_topic = get_mqtt_command_topic(config_entry.data)
         self._state_topic = get_mqtt_remote_topic(config_entry.data)
 
+        # Setpoint the user asked for that the Spider has not confirmed yet
+        self._pending_setpoint: float | None = None
+        self._sent_at: float | None = None  # None until the command is sent
+        self._cancel_send = None
+        self._battery = None
+        self._presence = None
+
         self._attr_name = remote_name
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, get_entity_prefix(config_entry.data))},
@@ -126,6 +153,23 @@ class IthoSpiderThermostat(ClimateEntity):
 
         self._apply(initial_payload)
 
+    @property
+    def icon(self) -> str | None:
+        """Show an hourglass while the Spider has not taken the setpoint."""
+        return "mdi:timer-sand" if self._pending_setpoint is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Extra attributes, including whether the setpoint is still pending."""
+        return {
+            "setpoint_status": (
+                "waiting for Spider" if self._pending_setpoint is not None else "applied"
+            ),
+            "pending_setpoint": self._pending_setpoint,
+            "battery": self._battery,
+            "presence": self._presence,
+        }
+
     def _apply(self, payload: dict) -> None:
         """Update state from a remotesinfo payload (does not write state)."""
         capabilities = payload.get(self._remote_name)
@@ -135,11 +179,37 @@ class IthoSpiderThermostat(ClimateEntity):
 
         self._attr_available = True
         self._attr_current_temperature = capabilities.get("temp")
-        self._attr_target_temperature = capabilities.get("setpoint")
-        self._attr_extra_state_attributes = {
-            "battery": capabilities.get("battery"),
-            "presence": bool(capabilities.get("pir")),
-        }
+        self._battery = capabilities.get("battery")
+        self._presence = bool(capabilities.get("pir"))
+
+        reported = capabilities.get("setpoint")
+        commanded = capabilities.get("setpoint_cmd")
+
+        if self._pending_setpoint is not None:
+            if _same(reported, self._pending_setpoint):
+                # The Spider took it
+                self._pending_setpoint = None
+            elif self._sent_at is not None:
+                waited = time.monotonic() - self._sent_at
+                if waited > PENDING_TIMEOUT:
+                    # The add-on stopped trying
+                    self._pending_setpoint = None
+                elif (
+                    waited > DROP_GRACE
+                    and commanded is not None
+                    and not _same(commanded, self._pending_setpoint)
+                ):
+                    # The add-on dropped it, e.g. changed on the Spider itself
+                    _LOGGER.debug(
+                        "%s: pending setpoint dropped by the add-on", self._remote_name
+                    )
+                    self._pending_setpoint = None
+
+        # Keep showing the requested value while it is pending
+        self._attr_target_temperature = (
+            self._pending_setpoint if self._pending_setpoint is not None else reported
+        )
+
         # The add-on lists remotes in slot order and skips empty slots; the
         # position in the message is the `rfremoteindex` the add-on expects.
         self._remote_index = list(payload).index(self._remote_name)
@@ -155,6 +225,12 @@ class IthoSpiderThermostat(ClimateEntity):
             )
         )
 
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel a scheduled send."""
+        if self._cancel_send:
+            self._cancel_send()
+            self._cancel_send = None
+
     @callback
     def _message_received(self, msg) -> None:
         """Handle remotesinfo update."""
@@ -167,22 +243,41 @@ class IthoSpiderThermostat(ClimateEntity):
             self.async_write_ha_state()
 
     async def async_set_temperature(self, **kwargs) -> None:
-        """Send a new setpoint to the Spider via the add-on."""
+        """Remember the new setpoint and send it once the user stopped changing it."""
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
+            return
+
+        self._pending_setpoint = float(temperature)
+        self._sent_at = None  # not sent yet
+        self._attr_target_temperature = self._pending_setpoint
+        self.async_write_ha_state()
+
+        # Restart the delay on every change so +/- presses are sent as one command
+        if self._cancel_send:
+            self._cancel_send()
+        self._cancel_send = async_call_later(self.hass, SEND_DELAY, self._send_pending)
+
+    async def _send_pending(self, _now) -> None:
+        """Send the pending setpoint to the Spider via the add-on."""
+        self._cancel_send = None
+        if self._pending_setpoint is None:
             return
 
         await mqtt.async_publish(
             self.hass,
             self._command_topic,
             json.dumps(
-                {"rfsetpoint": float(temperature), "rfremoteindex": self._remote_index}
+                {
+                    "rfsetpoint": self._pending_setpoint,
+                    "rfremoteindex": self._remote_index,
+                }
             ),
             MQTT_DEFAULT_QOS_PUBLISH,
         )
-        # Show the new value right away; the add-on confirms via remotesinfo
-        self._attr_target_temperature = temperature
+        self._sent_at = time.monotonic()
         self.async_write_ha_state()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Only HEAT is supported; nothing to do."""
+
