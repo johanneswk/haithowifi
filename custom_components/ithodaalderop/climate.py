@@ -27,6 +27,7 @@ from homeassistant.components.climate import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later
@@ -57,6 +58,10 @@ PENDING_TIMEOUT = 16 * 60  # seconds after sending
 # After sending, give the add-on this long to publish its own state before a
 # different `setpoint_cmd` is taken as "dropped".
 DROP_GRACE = 30  # seconds
+# Mode shown while the room is neither heating nor cooling. OFF makes the card
+# grey. If your card disables the +/- buttons in that state, use
+# HVACMode.HEAT_COOL instead.
+IDLE_MODE = HVACMode.OFF
 
 
 def _is_spider(capabilities) -> bool:
@@ -123,9 +128,13 @@ class IthoSpiderThermostat(ClimateEntity):
     _attr_has_entity_name = True
     _attr_should_poll = False
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    # The AutoTemp decides between heating and cooling by itself
-    _attr_hvac_modes = [HVACMode.HEAT_COOL]
-    _attr_hvac_mode = HVACMode.HEAT_COOL
+    # The mode follows what the room is doing right now, because the mode
+    # drives the colour and wording of the card (heat = orange, cool = blue,
+    # off = grey). It cannot be set by hand; the AutoTemp decides.
+    _attr_hvac_modes = list(
+        dict.fromkeys([HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL, IDLE_MODE])
+    )
+    _attr_hvac_mode = IDLE_MODE
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
     _attr_min_temp = 5.0
     _attr_max_temp = 30.0
@@ -258,6 +267,10 @@ class IthoSpiderThermostat(ClimateEntity):
             self._pending if self._pending is not None else reported
         )
         self._attr_hvac_action = self._action()
+        self._attr_hvac_mode = {
+            HVACAction.HEATING: HVACMode.HEAT,
+            HVACAction.COOLING: HVACMode.COOL,
+        }.get(self._attr_hvac_action, IDLE_MODE)
 
     def _apply(self, payload: dict) -> None:
         """Update from a remotesinfo payload (does not write state)."""
@@ -356,4 +369,7 @@ class IthoSpiderThermostat(ClimateEntity):
         self.async_write_ha_state()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """The AutoTemp chooses heating or cooling; nothing to do."""
+        """The mode follows the AutoTemp and cannot be set."""
+        raise ServiceValidationError(
+            "The mode follows what the AutoTemp is doing and cannot be changed"
+        )
