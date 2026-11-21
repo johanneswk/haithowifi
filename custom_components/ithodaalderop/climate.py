@@ -240,7 +240,7 @@ class Thermostat(ClimateEntity):
             _num(caps.get(key))
             for key in ("temp", "setpoint", "setpoint_cool", "setpoint_cmd")
         )
-        active = _first(room_setp, setpoint)  # the AutoTemp's setting is in force
+        active = _first(setpoint, room_setp)  # the Spider leads, the AutoTemp follows
         now = time.monotonic()
 
         if spider is None:
@@ -255,10 +255,11 @@ class Thermostat(ClimateEntity):
             ):
                 self._pending = None  # in force, dropped by the add-on or timed out
 
+        if self._status_topic and status is None:
+            action = HVACAction.IDLE  # wait for the AutoTemp instead of guessing
+        else:
+            action = _action(system, power, _first(room_temp, temp), active, cool)
         # The AutoTemp and Spider both lag, so keep heating/cooling for a while.
-        action = _action(
-            system, power, _first(room_temp, temp), _first(setpoint, room_setp), cool
-        )
         if action in MODES:
             self._held = (action, now + ACTION_HOLD)
         elif action == HVACAction.OFF:
@@ -290,7 +291,7 @@ class Thermostat(ClimateEntity):
             "setpoint_status": text,
             "pending_setpoint": pending,
             "active_setpoint": active,
-            "spider_setpoint": setpoint,
+            "autotemp_setpoint": room_setp,
             "setpoint_cool": cool,
             "system_state": system,
             "battery": _num(caps.get("battery")),
